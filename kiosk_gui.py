@@ -57,7 +57,8 @@ def pick_storage_base():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "signin_kiosk_data"))
 
 
-MASTER_CSV = "students_master.csv"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MASTER_CSV = os.path.join(SCRIPT_DIR, "students_master.csv")
 BASE_DATA_DIR = pick_storage_base()
 EXIT_CODE = "exit"
 VENV_PYTHON = "/home/gnomeskillet/kiosk-env/bin/python"
@@ -272,7 +273,7 @@ class KioskWindow(QWidget):
         try:
             self.students_by_id, self.students_by_username = load_students(MASTER_CSV)
         except FileNotFoundError:
-            QMessageBox.critical(self, "Error", f"{MASTER_CSV} not found in ~/signin_kiosk")
+            QMessageBox.critical(self, "Error", f"{MASTER_CSV} not found.")
             sys.exit(1)
 
         self.signins_path, self.photos_today_dir = get_today_paths()

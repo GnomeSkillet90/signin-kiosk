@@ -1,6 +1,6 @@
 # SIGN-IN KIOSK
 
-🟢 A Raspberry Pi–based sign-in kiosk system used for student attendance and verification.
+A Raspberry Pi–based sign-in kiosk system used for student attendance and verification.
 Designed for real-world use (Saturday School), with camera photo capture, barcode support,
 and Google Drive uploads. 
 
@@ -13,7 +13,7 @@ comfortable with basic Raspberry Pi and Python setup.
 
 ----------------------------------------------------------------
 
-## 📌 OVERVIEW
+## OVERVIEW
 
 This project consists of **two Python programs**:
 
@@ -27,7 +27,7 @@ The system was deployed and successfully used in a live school environment.
 
 ----------------------------------------------------------------
 
-## 🖥️ KIOSK FEATURES (kiosk_gui.py)
+## KIOSK FEATURES (kiosk_gui.py)
 
 - Full-screen touchscreen-friendly GUI (PyQt5)
 - Multiple sign-in methods:
@@ -56,7 +56,7 @@ The system was deployed and successfully used in a live school environment.
 
 ----------------------------------------------------------------
 
-## ☁️ UPLOAD FEATURES (upload_kiosk_day.py)
+## UPLOAD FEATURES (upload_kiosk_day.py)
 
 - Uploads the current day’s folder (CSV + photos) to Google Drive
 - Uses a Google Drive **service account**
@@ -78,7 +78,7 @@ The system was deployed and successfully used in a live school environment.
 
 ----------------------------------------------------------------
 
-## 🧠 DESIGN GOALS
+## DESIGN GOALS
 
 - Reliable in real-world use
 - No data loss
@@ -89,7 +89,7 @@ The system was deployed and successfully used in a live school environment.
 
 ----------------------------------------------------------------
 
-## 🔐 SECURITY & PRIVACY
+## SECURITY & PRIVACY
 
 The repository **does NOT include**:
 - Student CSV data
@@ -101,7 +101,7 @@ These are excluded via `.gitignore`.
 
 ----------------------------------------------------------------
 
-## 🚀 RUNNING THE KIOSK
+## RUNNING THE KIOSK
 
 Activate environment:
     source kiosk-env/bin/activate
@@ -113,7 +113,7 @@ The kiosk is configured to start automatically on boot via desktop autostart.
 
 ----------------------------------------------------------------
 
-## ⬆️ UPLOADING ATTENDANCE
+## UPLOADING ATTENDANCE
 
 From the kiosk:
     upload
@@ -126,7 +126,7 @@ From terminal:
 
 ----------------------------------------------------------------
 
-## 🛠️ REQUIREMENTS
+## REQUIREMENTS
 
 - Raspberry Pi OS (X11 desktop)
 - Python 3.9+
@@ -137,7 +137,7 @@ From terminal:
 
 ----------------------------------------------------------------
 
-## 📂 REPOSITORY STRUCTURE
+## REPOSITORY STRUCTURE
 
 signin_kiosk/
   kiosk_gui.py
@@ -148,7 +148,7 @@ signin_kiosk/
 
 ----------------------------------------------------------------
 
-## ✅ STATUS
+## STATUS
 
 ✔ Deployed  
 ✔ Tested in production  
@@ -170,7 +170,7 @@ signin_kiosk/
 
 ----------------------------------------------------------------
 
-## 📄 LICENSE
+## LICENSE
 
 Internal / educational use.
 Not intended for redistribution without modification.

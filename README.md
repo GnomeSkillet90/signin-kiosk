@@ -2,7 +2,14 @@
 
 🟢 A Raspberry Pi–based sign-in kiosk system used for student attendance and verification.
 Designed for real-world use (Saturday School), with camera photo capture, barcode support,
-and Google Drive uploads.
+and Google Drive uploads. 
+
+----------------------------------------------------------------
+
+## WHO THIS IS FOR
+
+This project is intended for educators or administrators 
+comfortable with basic Raspberry Pi and Python setup.
 
 ----------------------------------------------------------------
 
@@ -147,6 +154,19 @@ signin_kiosk/
 ✔ Tested in production  
 ✔ Actively used  
 ✔ Version-controlled on GitHub  
+
+----------------------------------------------------------------
+
+## SETUP OVERVIEW (for new installs)
+
+1. Install Raspberry Pi OS (desktop)
+2. Enable camera support
+3. Create Python virtual environment
+4. Install requirements
+5. Configure Google Drive service account
+6. Update config paths as needed
+7. Enable desktop autostart
+
 
 ----------------------------------------------------------------
 

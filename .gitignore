@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+kiosk-env/
+rfid-env/
+
+# Local data
+signin_kiosk_data/
+*.csv
+photos/
+signins/
+
+# Secrets
+*.json
+.config/
+
+# OS / misc
+.DS_Store

@@ -1,0 +1,702 @@
+import sys
+import os
+import csv
+import getpass
+import time
+import subprocess
+
+from datetime import datetime
+
+from libcamera import Transform
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QPlainTextEdit,
+    QLabel, QLineEdit, QPushButton, QMessageBox, QSizePolicy, QDialog,
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+
+from picamera2 import Picamera2
+from picamera2.previews.qt import QPicamera2
+
+
+def pick_storage_base():
+    """
+    Prefer the specific USB mount /media/<user>/USB if present & writable.
+    Otherwise, fall back to any writable auto-mounted drive.
+    Otherwise, fall back to SD (project folder).
+    """
+    user = getpass.getuser()
+
+    preferred = f"/media/{user}/USB"
+    if os.path.isdir(preferred) and os.access(preferred, os.W_OK):
+        base = os.path.join(preferred, "signin_kiosk_data")
+        try:
+            os.makedirs(base, exist_ok=True)
+            return base
+        except Exception:
+            pass  # fall through if creation fails
+
+    # Otherwise, try any writable mount under /media/<user> or /run/media/<user>
+    for root in (f"/media/{user}", f"/run/media/{user}"):
+        if not os.path.isdir(root):
+            continue
+        try:
+            for name in os.listdir(root):
+                mount_path = os.path.join(root, name)
+                if os.path.isdir(mount_path) and os.access(mount_path, os.W_OK):
+                    base = os.path.join(mount_path, "signin_kiosk_data")
+                    try:
+                        os.makedirs(base, exist_ok=True)
+                        return base
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # SD-card fallback
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "signin_kiosk_data"))
+
+
+MASTER_CSV = "students_master.csv"
+BASE_DATA_DIR = pick_storage_base()
+EXIT_CODE = "exit"
+VENV_PYTHON = "/home/gnomeskillet/kiosk-env/bin/python"
+UPLOAD_SCRIPT = "/home/gnomeskillet/signin_kiosk/upload_kiosk_day.py"
+
+
+def clean_name_for_filename(name: str) -> str:
+    """Remove spaces and non-alphanumeric characters for safe filenames."""
+    return "".join(c for c in name if c.isalnum())
+
+def normalize_login(value: str) -> str:
+    """
+    Normalize ID / username / email input.
+    - lowercase
+    - strip whitespace
+    - if email, keep only before '@'
+    """
+    value = value.strip().lower()
+    if "@" in value:
+        value = value.split("@", 1)[0]
+    return value
+
+def load_students(master_csv):
+    by_id = {}
+    by_username = {}
+
+    with open(master_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sid = row["Student ID"].strip()
+            email = row.get("Email Address", "").strip()
+
+            by_id[sid] = row
+
+            if email:
+                username = normalize_login(email)
+                by_username[username] = row
+
+    return by_id, by_username
+
+def ensure_dirs():
+    os.makedirs(BASE_DATA_DIR, exist_ok=True)
+
+def get_today_paths():
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # One folder per day
+    today_dir = os.path.join(BASE_DATA_DIR, today_str)
+    photos_today_dir = os.path.join(today_dir, "photos")
+
+    os.makedirs(photos_today_dir, exist_ok=True)
+
+    signins_path = os.path.join(today_dir, f"signins_{today_str}.csv")
+
+    return signins_path, photos_today_dir
+
+def init_signins_file(path):
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp",
+                "student_id",
+                "full_name",
+                "grade",
+                "email",
+                "photo_filename",
+            ])
+
+class ConfirmDialog(QDialog):
+    def __init__(self, full_name: str, grade: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Confirm")
+        self.setModal(True)
+
+        layout = QVBoxLayout()
+
+        title = QLabel("Is this you?")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 28px; font-weight: bold;")
+
+        name_lbl = QLabel(full_name)
+        name_lbl.setAlignment(Qt.AlignCenter)
+        name_lbl.setStyleSheet("font-size: 34px; font-weight: bold;")
+
+        grade_lbl = QLabel(f"Grade: {grade}")
+        grade_lbl.setAlignment(Qt.AlignCenter)
+        grade_lbl.setStyleSheet("font-size: 24px;")
+
+        info_lbl = QLabel("Your photo will be taken for verification purposes.")
+        info_lbl.setAlignment(Qt.AlignCenter)
+        info_lbl.setStyleSheet("font-size: 16px; color: #555555;")
+
+        btns = QGridLayout()
+
+        yes_btn = QPushButton("✅ Yes, that's me\n(Press Y or tap here)")
+        yes_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 26px;
+                padding: 18px;
+            }
+        """)
+        yes_btn.clicked.connect(self._accept_and_stop)
+
+        no_btn = QPushButton("❌ No / Go back\n(Press N or tap here)")
+        no_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 26px;
+                padding: 18px;
+            }
+        """)
+        no_btn.clicked.connect(self._reject_and_stop)
+
+        btns.addWidget(yes_btn, 0, 0)
+        btns.addWidget(no_btn, 1, 0)
+
+        layout.addWidget(title)
+        layout.addSpacing(10)
+        layout.addWidget(name_lbl)
+        layout.addWidget(grade_lbl)
+        layout.addSpacing(8)
+        layout.addWidget(info_lbl)
+        layout.addSpacing(15)
+        layout.addLayout(btns)
+
+        self.setLayout(layout)
+
+        # Make it big enough for touchscreen
+        self.setFixedWidth(600)
+        self.adjustSize()
+
+
+        # Auto-timeout (10 seconds) -> cancel
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.reject)
+        self._timer.start(10_000)
+
+    def _accept_and_stop(self):
+        if hasattr(self, "_timer"):
+            self._timer.stop()
+        self.accept()
+
+    def _reject_and_stop(self):
+        if hasattr(self, "_timer"):
+            self._timer.stop()
+        self.reject()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Y, Qt.Key_Return, Qt.Key_Enter):
+            self._accept_and_stop()
+        elif key in (Qt.Key_N, Qt.Key_Escape):
+            self._reject_and_stop()
+        else:
+            super().keyPressEvent(event)
+
+class UploadProgressDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Uploading to Google Drive")
+        self.setModal(False)
+
+        layout = QVBoxLayout()
+
+        self.lbl = QLabel("Uploading… (live log below)")
+        self.lbl.setAlignment(Qt.AlignCenter)
+        self.lbl.setStyleSheet("font-size: 20px;")
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("font-size: 14px;")
+        self.log.setMinimumHeight(320)
+
+        layout.addWidget(self.lbl)
+        layout.addWidget(self.log)
+        self.setLayout(layout)
+        self.resize(720, 420)
+        self.setMaximumHeight(440)
+
+
+    def append_line(self, line: str):
+        self.log.appendPlainText(line.rstrip())
+        # Auto-scroll to bottom
+        sb = self.log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+class CaptureWorker(QThread):
+    done = pyqtSignal(str)    # photo_filename
+    failed = pyqtSignal(str)  # error msg
+
+    def __init__(self, picam2, still_config, photo_path):
+        super().__init__()
+        self.picam2 = picam2
+        self.still_config = still_config
+        self.photo_path = photo_path
+
+    def run(self):
+        try:
+            # Switch from preview mode to still mode for capture (more reliable)
+            self.picam2.switch_mode_and_capture_file(self.still_config, self.photo_path)
+            self.done.emit(os.path.basename(self.photo_path))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+class KioskWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        ensure_dirs()
+
+        try:
+            self.students_by_id, self.students_by_username = load_students(MASTER_CSV)
+        except FileNotFoundError:
+            QMessageBox.critical(self, "Error", f"{MASTER_CSV} not found in ~/signin_kiosk")
+            sys.exit(1)
+
+        self.signins_path, self.photos_today_dir = get_today_paths()
+        init_signins_file(self.signins_path)
+        self.signed_in_ids = set()
+
+        # --- Camera setup ---
+        self.picam2 = Picamera2()
+
+        # Force a full-FOV binned sensor mode (feels more like rpicam-hello)
+        self.preview_config = self.picam2.create_preview_configuration(
+            main={"size": (720, 720)},
+            raw={"size": (2304, 1296)},
+            transform=Transform(hflip=1),
+            controls={"AfMode": 2}
+        )
+
+        self.still_config = self.picam2.create_still_configuration(
+            main={"size": (1600, 1200)},
+            raw={"size": (2304, 1296)},
+            transform=Transform(hflip=1),
+            controls={"AfMode": 2}
+        )
+
+        self.picam2.configure(self.preview_config)
+
+        # Build UI first so widget sizes exist
+        self.capture_worker = None
+        self.pending_student = None
+        self.build_ui()
+        self.update_signed_in_count()
+
+
+
+        # Status reset timer (go back to idle after messages)
+        self.idle_status_text = "Ready. Enter your Student ID."
+        self.idle_status_color = "#0000aa"
+
+        self._status_reset_timer = QTimer(self)
+        self._status_reset_timer.setSingleShot(True)
+        self._status_reset_timer.timeout.connect(self.show_idle_status)
+
+        # Show idle status at startup
+        self.show_idle_status()
+
+        # Now start camera and attach preview widget
+        self.picam2.start()
+
+        QTimer.singleShot(200, self.apply_preview_crop)
+
+        # Apply crop after the window is shown (sizes settle)
+        self.apply_preview_crop()
+
+    def build_ui(self):
+        self.setWindowTitle("Sign-In Kiosk")
+
+        root = QHBoxLayout()
+
+        PREVIEW = 360  # try 360 first on 800x480
+
+        self.qpicam = QPicamera2(self.picam2, width=PREVIEW, height=PREVIEW)
+        self.qpicam.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.qpicam.setFixedSize(PREVIEW, PREVIEW)
+
+        # Countdown overlay (hidden by default)
+        self.countdown_label = QLabel("", self.qpicam)
+        self.countdown_label.setAlignment(Qt.AlignCenter)
+        self.countdown_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                background-color: rgba(0, 0, 0, 120);
+                font-size: 96px;
+                font-weight: bold;
+            }
+        """)
+        self.countdown_label.hide()
+        self.countdown_label.resize(self.qpicam.size)
+
+        root.addWidget(self.qpicam, stretch=0)
+
+        side = QVBoxLayout()
+
+        title = QLabel("Sign-In Kiosk")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 26px; font-weight: bold;")
+
+        prompt = QLabel("Scan ID card or Chromebook name barcode\nor type Student ID # / email")
+        prompt.setAlignment(Qt.AlignCenter)
+        prompt.setStyleSheet("font-size: 18px;")
+
+        self.id_input = QLineEdit()
+        self.id_input.setMaxLength(20)
+        self.id_input.setPlaceholderText("Student ID or email")
+        self.id_input.setStyleSheet("font-size: 26px; padding: 10px;")
+        self.id_input.returnPressed.connect(self.handle_sign_in)
+
+        self.sign_in_btn = QPushButton("Sign In")
+        self.sign_in_btn.setStyleSheet("font-size: 26px; padding: 14px;")
+        self.sign_in_btn.clicked.connect(self.handle_sign_in)
+
+        self.status = QLabel("")
+        self.status.setAlignment(Qt.AlignCenter)
+        self.status.setStyleSheet("font-size: 16px; color: #00aa00;")
+
+        self.count_label = QLabel("Signed in today: 0")
+        self.count_label.setAlignment(Qt.AlignCenter)
+        self.count_label.setStyleSheet("font-size: 18px; color: #333333;")
+
+        side.addWidget(title)
+        side.addSpacing(10)
+        side.addWidget(prompt)
+        side.addWidget(self.id_input)
+        side.addSpacing(10)
+        side.addWidget(self.sign_in_btn)
+        side.addSpacing(20)
+        side.addWidget(self.status)
+        side.addStretch()
+        side.addWidget(self.count_label)
+
+        root.addLayout(side, stretch=2)
+        self.setLayout(root)
+
+        self.showFullScreen()
+        self.id_input.setFocus()
+
+    def update_signed_in_count(self):
+        self.count_label.setText(f"Signed in today: {len(self.signed_in_ids)}")
+
+    def apply_preview_crop(self):
+        """
+        Square crop using full available vertical height.
+        Crops ONLY left/right to make the preview square.
+        """
+        x0, y0, max_w, max_h = self.picam2.camera_properties["ScalerCropMaximum"]
+
+        # We want a square crop based on full height
+        crop_h = max_h
+        crop_w = crop_h  # square
+
+        # Clamp just in case (should already fit)
+        crop_w = min(crop_w, max_w)
+
+        # Center horizontally, keep full vertical
+        x = x0 + (max_w - crop_w) // 2
+        y = y0
+
+        self.picam2.set_controls({"ScalerCrop": (x, y, crop_w, crop_h), "AfMode": 2})
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self.apply_preview_crop()
+            self.countdown_label.resize(self.qpicam.size())
+        except Exception:
+            pass
+
+    def set_status(self, text, color_hex):
+        self.status.setStyleSheet(f"font-size: 16px; color: {color_hex};")
+        self.status.setText(text)
+
+    def handle_sign_in(self):
+        # If a reset is pending, cancel it while we process a new sign-in
+        if hasattr(self, "_status_reset_timer"):
+            self._status_reset_timer.stop()
+
+        if self.capture_worker and self.capture_worker.isRunning():
+            return
+
+        raw_input = self.id_input.text()
+        login = normalize_login(raw_input)
+
+        cmd = (raw_input or "").strip().lower()
+
+        # Command: upload (optional date: "upload 2026-01-17")
+        if cmd == "upload" or cmd.startswith("upload "):
+            parts = cmd.split()
+            date_arg = parts[1] if len(parts) > 1 else None
+            self.start_upload(date_arg=date_arg)
+            self.id_input.clear()
+            self.id_input.setFocus()
+            return
+
+        if not login:
+            return
+
+        # Allow exit code only when typed as-is (numbers)
+        if login == EXIT_CODE:
+            self.close()
+            return
+
+        # --- Lookup student by numeric ID OR username/email ---
+        student = None
+        student_id = None
+
+        # 1) Numeric student ID
+        if login.isdigit() and login in self.students_by_id:
+            student = self.students_by_id[login]
+            student_id = login
+
+        # 2) Chromebook barcode username OR full email
+        elif login in self.students_by_username:
+            student = self.students_by_username[login]
+            student_id = student["Student ID"].strip()
+
+        if not student:
+            self.set_status("ID or email not found. Please try again.", "#cc0000")
+            self._status_reset_timer.start(4000)
+            self.id_input.clear()
+            return
+
+        # Duplicate sign-in check (always use resolved numeric ID)
+        if student_id in self.signed_in_ids:
+            full_name = student.get("Full Name", "").strip()
+            self.set_status(f"{full_name} is already signed in.", "#cc0000")
+            self._status_reset_timer.start(4000)
+            self.id_input.clear()
+            return
+
+        # --- From here down, your original flow stays the same ---
+        full_name = student.get("Full Name", "").strip()
+        grade = str(student.get("Grade", "")).strip()
+        email = student.get("Email Address", "").strip()
+
+        # Expecting "Last, First" OR "First Last"
+        if "," in full_name:
+            last, first = [p.strip() for p in full_name.split(",", 1)]
+        else:
+            parts = full_name.split()
+            first = parts[0]
+            last = parts[-1] if len(parts) > 1 else "Unknown"
+
+        first = clean_name_for_filename(first)
+        last = clean_name_for_filename(last)
+
+        dlg = ConfirmDialog(full_name, grade, self)
+        if dlg.exec_() != QDialog.Accepted:
+            self.set_status("Cancelled. Please re-enter your ID.", "#cc0000")
+            self._status_reset_timer.start(4000)
+            self.id_input.clear()
+            self.id_input.setFocus()
+            return
+
+        # Prepare log + filenames now, but wait to capture until after countdown
+        now = datetime.now()
+        timestamp_str = now.isoformat(timespec="seconds")
+        photo_filename = f"{last}_{first}_{now.strftime('%H%M')}_{student_id}.jpg"
+        photo_path = os.path.join(self.photos_today_dir, photo_filename)
+
+        self.pending_student = (timestamp_str, student_id, full_name, grade, email, photo_filename)
+        self.photo_path = photo_path
+
+        # Start the 3..2..1..SMILE countdown (then capture)
+        self.start_countdown_and_capture()
+
+    def start_upload(self, date_arg=None):
+        if hasattr(self, "upload_worker") and self.upload_worker and self.upload_worker.isRunning():
+            self.set_status("Upload already running…", "#0000aa")
+            return
+
+        self.set_status("Uploading to Google Drive…", "#0000aa")
+        self.sign_in_btn.setEnabled(False)
+        self.id_input.setEnabled(False)
+
+        self.upload_dialog = UploadProgressDialog(self)
+        self.upload_dialog.show()
+        QApplication.processEvents()
+
+        self.upload_worker = UploadWorker(date_arg=date_arg, parent=self)
+
+        # LIVE output -> dialog
+        self.upload_worker.output_line.connect(self.upload_dialog.append_line)
+
+        self.upload_worker.finished_ok.connect(self.on_upload_ok)
+        self.upload_worker.finished_err.connect(self.on_upload_err)
+        self.upload_worker.start()
+
+    def on_upload_ok(self, output: str):
+        try:
+            if self.upload_dialog:
+                self.upload_dialog.lbl.setText("✅ Upload complete.")
+        except Exception:
+            pass
+
+        self.set_status("Upload complete ✅", "#00aa00")
+        self._status_reset_timer.start(4000)
+        self.sign_in_btn.setEnabled(True)
+        self.id_input.setEnabled(True)
+        self.id_input.setFocus()
+        # You can leave the dialog open for review or auto-close after a few seconds:
+        QTimer.singleShot(2500, self.upload_dialog.close)
+
+    def on_upload_err(self, output: str):
+        try:
+            if self.upload_dialog:
+                self.upload_dialog.lbl.setText("❌ Upload failed. See log.")
+        except Exception:
+            pass
+
+        QMessageBox.critical(self, "Upload failed", "Upload failed. See log for details.")
+        self.set_status("Upload failed ❌", "#cc0000")
+        self._status_reset_timer.start(6000)
+        self.sign_in_btn.setEnabled(True)
+        self.id_input.setEnabled(True)
+        self.id_input.setFocus()
+
+    def on_capture_done(self, _photo_filename):
+        try:
+            with open(self.signins_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(list(self.pending_student))
+        except Exception as e:
+            self.set_status(f"Photo ok, but log failed: {e}", "#cc0000")
+        else:
+            _, _, full_name, grade, _, _ = self.pending_student
+            self.signed_in_ids.add(self.pending_student[1])
+            self.update_signed_in_count()
+            self.set_status(f"Signed in: {full_name} (Grade {grade})", "#00aa00")
+            # After 4 seconds, go back to idle message
+            self._status_reset_timer.start(4000)
+
+        self.pending_student = None
+        self.id_input.clear()
+        self.id_input.setFocus()
+        self.sign_in_btn.setEnabled(True)
+
+    def on_capture_failed(self, msg):
+        self.set_status(f"Camera error: {msg}", "#cc0000")
+        self._status_reset_timer.start(5000)
+        self.pending_student = None
+        self.sign_in_btn.setEnabled(True)
+        self.id_input.setFocus()
+
+    def closeEvent(self, event):
+        try:
+            self.picam2.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def start_countdown_and_capture(self):
+        self._countdown_value = 3
+        self.countdown_label.setText(str(self._countdown_value))
+        self.countdown_label.show()
+
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.timeout.connect(self._countdown_tick)
+        self._countdown_timer.start(1000)
+
+    def _countdown_tick(self):
+        self._countdown_value -= 1
+
+        if self._countdown_value > 0:
+            self.countdown_label.setText(str(self._countdown_value))
+        elif self._countdown_value == 0:
+            self.countdown_label.setText("SMILE!")
+        else:
+            self._countdown_timer.stop()
+            self.countdown_label.hide()
+            self._begin_capture()
+
+    def _begin_capture(self):
+        self.set_status("Taking photo…", "#0000aa")
+        self.sign_in_btn.setEnabled(False)
+
+        self.capture_worker = CaptureWorker(
+            self.picam2,
+            self.still_config,
+            self.photo_path
+        )
+        self.capture_worker.done.connect(self.on_capture_done)
+        self.capture_worker.failed.connect(self.on_capture_failed)
+        self.capture_worker.start()
+
+    def show_idle_status(self):
+        self.set_status(self.idle_status_text, self.idle_status_color)
+
+class UploadWorker(QThread):
+    output_line = pyqtSignal(str)     # streamed output
+    finished_ok = pyqtSignal(str)     # final full output
+    finished_err = pyqtSignal(str)
+
+    def __init__(self, date_arg=None, parent=None):
+        super().__init__(parent)
+        self.date_arg = date_arg
+
+    def run(self):
+        cmd = [VENV_PYTHON, "-u", UPLOAD_SCRIPT]  # -u = unbuffered output (IMPORTANT)
+        if self.date_arg:
+            cmd.append(self.date_arg)
+
+        all_lines = []
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1  # line-buffered
+            )
+
+            # Stream lines as they arrive
+            for line in proc.stdout:
+                all_lines.append(line)
+                self.output_line.emit(line)
+
+            rc = proc.wait()
+            full_output = "".join(all_lines)
+
+            if rc == 0:
+                self.finished_ok.emit(full_output)
+            else:
+                self.finished_err.emit(full_output)
+
+        except Exception as e:
+            self.finished_err.emit(str(e))
+
+def main():
+    app = QApplication(sys.argv)
+    win = KioskWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

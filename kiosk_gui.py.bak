@@ -57,8 +57,7 @@ def pick_storage_base():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "signin_kiosk_data"))
 
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MASTER_CSV = os.path.join(SCRIPT_DIR, "students_master.csv")
+MASTER_CSV = "students_master.csv"
 BASE_DATA_DIR = pick_storage_base()
 EXIT_CODE = "exit"
 VENV_PYTHON = "/home/gnomeskillet/kiosk-env/bin/python"
@@ -236,9 +235,7 @@ class UploadProgressDialog(QDialog):
         layout.addWidget(self.lbl)
         layout.addWidget(self.log)
         self.setLayout(layout)
-        self.resize(720, 420)
-        self.setMaximumHeight(440)
-
+        self.resize(720, 520)
 
     def append_line(self, line: str):
         self.log.appendPlainText(line.rstrip())
@@ -273,7 +270,7 @@ class KioskWindow(QWidget):
         try:
             self.students_by_id, self.students_by_username = load_students(MASTER_CSV)
         except FileNotFoundError:
-            QMessageBox.critical(self, "Error", f"{MASTER_CSV} not found.")
+            QMessageBox.critical(self, "Error", f"{MASTER_CSV} not found in ~/signin_kiosk")
             sys.exit(1)
 
         self.signins_path, self.photos_today_dir = get_today_paths()
@@ -309,7 +306,7 @@ class KioskWindow(QWidget):
 
 
         # Status reset timer (go back to idle after messages)
-        self.idle_status_text = "Ready. Enter your email/username."
+        self.idle_status_text = "Ready. Enter your Student ID."
         self.idle_status_color = "#0000aa"
 
         self._status_reset_timer = QTimer(self)
@@ -360,13 +357,13 @@ class KioskWindow(QWidget):
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 26px; font-weight: bold;")
 
-        prompt = QLabel('Enter your Email username\nor scan your student ID\nYou do NOT need the "@cps.k12.ar.us"')
+        prompt = QLabel("Scan ID card or Chromebook name barcode\nor type Student ID # / email")
         prompt.setAlignment(Qt.AlignCenter)
         prompt.setStyleSheet("font-size: 18px;")
 
         self.id_input = QLineEdit()
         self.id_input.setMaxLength(20)
-        self.id_input.setPlaceholderText("Email username")
+        self.id_input.setPlaceholderText("Student ID or email")
         self.id_input.setStyleSheet("font-size: 26px; padding: 10px;")
         self.id_input.returnPressed.connect(self.handle_sign_in)
 

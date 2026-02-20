@@ -16,3 +16,12 @@ signins/
 
 # OS / misc
 .DS_Store
+
+# backup files
+*.bak
+*.tmp
+*.swp
+
+# RFID writer (not part of kiosk)
+rfid_writer_gui.py
+run_rfid_writer.sh

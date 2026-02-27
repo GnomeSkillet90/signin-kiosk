@@ -6,6 +6,7 @@ import time
 import subprocess
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from libcamera import Transform
 
@@ -63,6 +64,32 @@ BASE_DATA_DIR = pick_storage_base()
 EXIT_CODE = "exit"
 VENV_PYTHON = "/home/gnomeskillet/kiosk-env/bin/python"
 UPLOAD_SCRIPT = "/home/gnomeskillet/signin_kiosk/upload_kiosk_day.py"
+KIOSK_TZ = ZoneInfo("America/Chicago")
+
+
+def now_local() -> datetime:
+    return datetime.now(KIOSK_TZ)
+
+def is_clock_synchronized() -> bool:
+    """
+    Return True when system time is considered reliable.
+    Prefer timedatectl's NTPSynchronized flag; fall back to a sane-year check.
+    """
+    try:
+        res = subprocess.run(
+            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip().lower() == "yes"
+    except Exception:
+        pass
+
+    # Fallback for environments without timedatectl.
+    return now_local().year >= 2025
 
 
 def clean_name_for_filename(name: str) -> str:
@@ -103,7 +130,7 @@ def ensure_dirs():
     os.makedirs(BASE_DATA_DIR, exist_ok=True)
 
 def get_today_paths():
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_local().strftime("%Y-%m-%d")
 
     # One folder per day
     today_dir = os.path.join(BASE_DATA_DIR, today_str)
@@ -127,6 +154,28 @@ def init_signins_file(path):
                 "email",
                 "photo_filename",
             ])
+
+def load_signed_in_ids(path):
+    """
+    Rebuild today's in-memory signed-in set from the daily CSV.
+    Uses unique student_id values so duplicate rows don't inflate the count.
+    """
+    signed_in_ids = set()
+    if not os.path.exists(path):
+        return signed_in_ids
+
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sid = (row.get("student_id") or "").strip()
+                if sid:
+                    signed_in_ids.add(sid)
+    except Exception:
+        # If CSV is malformed/unreadable, keep kiosk running with empty state.
+        return set()
+
+    return signed_in_ids
 
 class ConfirmDialog(QDialog):
     def __init__(self, full_name: str, grade: str, parent=None):
@@ -276,9 +325,10 @@ class KioskWindow(QWidget):
             QMessageBox.critical(self, "Error", f"{MASTER_CSV} not found.")
             sys.exit(1)
 
-        self.signins_path, self.photos_today_dir = get_today_paths()
-        init_signins_file(self.signins_path)
-        self.signed_in_ids = set()
+        self.current_day_str = None
+        self.signins_path = None
+        self.photos_today_dir = None
+        self.refresh_today_paths(force=True)
 
         # --- Camera setup ---
         self.picam2 = Picamera2()
@@ -306,8 +356,6 @@ class KioskWindow(QWidget):
         self.build_ui()
         self.update_signed_in_count()
 
-
-
         # Status reset timer (go back to idle after messages)
         self.idle_status_text = "Ready. Enter your email/username."
         self.idle_status_color = "#0000aa"
@@ -315,6 +363,13 @@ class KioskWindow(QWidget):
         self._status_reset_timer = QTimer(self)
         self._status_reset_timer.setSingleShot(True)
         self._status_reset_timer.timeout.connect(self.show_idle_status)
+
+        self.clock_ready = False
+        self._clock_timer = QTimer(self)
+        self._clock_timer.setInterval(10_000)
+        self._clock_timer.timeout.connect(self.update_clock_ready_state)
+        self._clock_timer.start()
+        self.update_clock_ready_state()
 
         # Show idle status at startup
         self.show_idle_status()
@@ -434,7 +489,26 @@ class KioskWindow(QWidget):
         self.status.setStyleSheet(f"font-size: 16px; color: {color_hex};")
         self.status.setText(text)
 
+    def refresh_today_paths(self, force=False):
+        day_str = now_local().strftime("%Y-%m-%d")
+        if not force and day_str == self.current_day_str:
+            return
+
+        self.current_day_str = day_str
+        self.signins_path, self.photos_today_dir = get_today_paths()
+        init_signins_file(self.signins_path)
+
+        # Rebuild in-memory "signed in today" view from today's CSV at startup/day rollover.
+        self.signed_in_ids = load_signed_in_ids(self.signins_path)
+        if hasattr(self, "count_label"):
+            self.update_signed_in_count()
+
     def handle_sign_in(self):
+        if not self.clock_ready:
+            return
+
+        self.refresh_today_paths()
+
         # If a reset is pending, cancel it while we process a new sign-in
         if hasattr(self, "_status_reset_timer"):
             self._status_reset_timer.stop()
@@ -517,7 +591,7 @@ class KioskWindow(QWidget):
             return
 
         # Prepare log + filenames now, but wait to capture until after countdown
-        now = datetime.now()
+        now = now_local()
         timestamp_str = now.isoformat(timespec="seconds")
         photo_filename = f"{last}_{first}_{now.strftime('%H%M')}_{student_id}.jpg"
         photo_path = os.path.join(self.photos_today_dir, photo_filename)
@@ -648,7 +722,25 @@ class KioskWindow(QWidget):
         self.capture_worker.start()
 
     def show_idle_status(self):
+        if not self.clock_ready:
+            return
         self.set_status(self.idle_status_text, self.idle_status_color)
+
+    def update_clock_ready_state(self):
+        self.clock_ready = is_clock_synchronized()
+
+        self.id_input.setEnabled(self.clock_ready)
+        self.sign_in_btn.setEnabled(self.clock_ready)
+
+        if self.clock_ready:
+            self.show_idle_status()
+            return
+
+        now_txt = now_local().strftime("%Y-%m-%d %H:%M")
+        self.set_status(
+            f"Waiting for clock sync... Current device time: {now_txt}",
+            "#cc0000",
+        )
 
 class UploadWorker(QThread):
     output_line = pyqtSignal(str)     # streamed output

@@ -2,6 +2,7 @@
 import sys
 import mimetypes
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import os
 import getpass
@@ -63,6 +64,11 @@ LOCAL_BASE_DATA_DIR = pick_storage_base()
 # ==================
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+KIOSK_TZ = ZoneInfo("America/Chicago")
+
+
+def now_local() -> datetime:
+    return datetime.now(KIOSK_TZ)
 
 def find_child_by_name(service, parent_id: str, name: str):
     """
@@ -181,7 +187,7 @@ def upload_tree(service, local_dir: Path, drive_parent_id: str, pbar: tqdm, stat
 
 def main():
     # Optional argument: YYYY-MM-DD (defaults to today)
-    date_str = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime("%Y-%m-%d")
+    date_str = sys.argv[1] if len(sys.argv) > 1 else now_local().strftime("%Y-%m-%d")
 
     stats = {
         "created": 0,
@@ -256,4 +262,3 @@ if __name__ == "__main__":
     finally:
         pause_to_close("\nPress Enter to close this window...")
     sys.exit(exit_code)
-

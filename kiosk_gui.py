@@ -73,8 +73,10 @@ def now_local() -> datetime:
 def is_clock_synchronized() -> bool:
     """
     Return True when system time is considered reliable.
-    Prefer timedatectl's NTPSynchronized flag; fall back to a sane-year check.
+    Accept either NTP sync OR a sane local clock (e.g., RTC-backed offline boot).
     """
+    sane_local_clock = now_local().year >= 2025
+
     try:
         res = subprocess.run(
             ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
@@ -84,12 +86,15 @@ def is_clock_synchronized() -> bool:
             check=False,
         )
         if res.returncode == 0:
-            return res.stdout.strip().lower() == "yes"
+            if res.stdout.strip().lower() == "yes":
+                return True
+            # Offline kiosks can still have correct time via RTC.
+            return sane_local_clock
     except Exception:
         pass
 
     # Fallback for environments without timedatectl.
-    return now_local().year >= 2025
+    return sane_local_clock
 
 
 def clean_name_for_filename(name: str) -> str:
@@ -407,6 +412,24 @@ class KioskWindow(QWidget):
         self.countdown_label.hide()
         self.countdown_label.resize(self.qpicam.size)
 
+        # Temporary success popup overlay
+        self.success_popup = QLabel("", self)
+        self.success_popup.setAlignment(Qt.AlignCenter)
+        self.success_popup.setWordWrap(True)
+        self.success_popup.setStyleSheet("""
+            QLabel {
+                color: #0b3d0b;
+                background-color: rgba(236, 255, 236, 245);
+                border: 4px solid #1c8f1c;
+                border-radius: 18px;
+                font-size: 34px;
+                font-weight: bold;
+                padding: 18px;
+            }
+        """)
+        self.success_popup.hide()
+        self.success_popup.setFixedSize(760, 260)
+
         root.addWidget(self.qpicam, stretch=0)
 
         side = QVBoxLayout()
@@ -433,7 +456,7 @@ class KioskWindow(QWidget):
         self.status.setAlignment(Qt.AlignCenter)
         self.status.setStyleSheet("font-size: 16px; color: #00aa00;")
 
-        self.count_label = QLabel("Signed in today: 0")
+        self.count_label = QLabel("Total Sign-Ins for today: 0")
         self.count_label.setAlignment(Qt.AlignCenter)
         self.count_label.setStyleSheet("font-size: 18px; color: #333333;")
 
@@ -455,7 +478,10 @@ class KioskWindow(QWidget):
         self.id_input.setFocus()
 
     def update_signed_in_count(self):
-        self.count_label.setText(f"Signed in today: {len(self.signed_in_ids)}")
+        folder_name = self.current_day_str or "today"
+        if self.signins_path:
+            folder_name = os.path.basename(os.path.dirname(self.signins_path)) or folder_name
+        self.count_label.setText(f"Total Sign-Ins for {folder_name}: {len(self.signed_in_ids)}")
 
     def apply_preview_crop(self):
         """
@@ -482,12 +508,25 @@ class KioskWindow(QWidget):
         try:
             self.apply_preview_crop()
             self.countdown_label.resize(self.qpicam.size())
+            self._position_success_popup()
         except Exception:
             pass
 
     def set_status(self, text, color_hex):
         self.status.setStyleSheet(f"font-size: 16px; color: {color_hex};")
         self.status.setText(text)
+
+    def _position_success_popup(self):
+        x = max(0, (self.width() - self.success_popup.width()) // 2)
+        y = max(0, (self.height() - self.success_popup.height()) // 2)
+        self.success_popup.move(x, y)
+
+    def show_success_popup(self, message: str, duration_ms: int = 2000):
+        self.success_popup.setText(message)
+        self._position_success_popup()
+        self.success_popup.raise_()
+        self.success_popup.show()
+        QTimer.singleShot(duration_ms, self.success_popup.hide)
 
     def refresh_today_paths(self, force=False):
         day_str = now_local().strftime("%Y-%m-%d")
@@ -665,6 +704,7 @@ class KioskWindow(QWidget):
             self.signed_in_ids.add(self.pending_student[1])
             self.update_signed_in_count()
             self.set_status(f"Signed in: {full_name} (Grade {grade})", "#00aa00")
+            self.show_success_popup("You have successfully signed in.\nPlease have a seat.", 2200)
             # After 4 seconds, go back to idle message
             self._status_reset_timer.start(4000)
 
@@ -738,7 +778,7 @@ class KioskWindow(QWidget):
 
         now_txt = now_local().strftime("%Y-%m-%d %H:%M")
         self.set_status(
-            f"Waiting for clock sync... Current device time: {now_txt}",
+            f"Clock not valid yet. Current device time: {now_txt}",
             "#cc0000",
         )
 

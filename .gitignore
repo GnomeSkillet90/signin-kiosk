@@ -9,10 +9,12 @@ signin_kiosk_data/
 *.csv
 photos/
 signins/
+.codex/
 
 # Secrets
 *.json
 .config/
+.env
 
 # OS / misc
 .DS_Store

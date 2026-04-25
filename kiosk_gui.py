@@ -65,6 +65,8 @@ EXIT_CODE = "exit"
 VENV_PYTHON = "/home/gnomeskillet/kiosk-env/bin/python"
 UPLOAD_SCRIPT = "/home/gnomeskillet/signin_kiosk/upload_kiosk_day.py"
 KIOSK_TZ = ZoneInfo("America/Chicago")
+BUZZER_BCM_PIN = 18
+BUZZER_BOARD_PIN = 12
 
 
 def now_local() -> datetime:
@@ -113,6 +115,85 @@ def normalize_login(value: str) -> str:
         value = value.split("@", 1)[0]
     return value
 
+def clean_tag_text(text: str) -> str:
+    """Remove null padding and whitespace from RFID tag text."""
+    return (text or "").replace("\x00", "").strip()
+
+
+class PiezoBuzzer:
+    def __init__(self, bcm_pin=BUZZER_BCM_PIN, board_pin=BUZZER_BOARD_PIN):
+        self.pin = None
+        self.GPIO = None
+        self.pwm = None
+
+        try:
+            import RPi.GPIO as GPIO
+
+            GPIO.setwarnings(False)
+            mode = GPIO.getmode()
+            if mode is None:
+                GPIO.setmode(GPIO.BCM)
+                self.pin = bcm_pin
+            elif mode == GPIO.BCM:
+                self.pin = bcm_pin
+            elif mode == GPIO.BOARD:
+                self.pin = board_pin
+            else:
+                return
+
+            GPIO.setup(self.pin, GPIO.OUT)
+
+            self.GPIO = GPIO
+            self.pwm = GPIO.PWM(self.pin, 2000)
+        except Exception:
+            self.GPIO = None
+            self.pwm = None
+
+    def success_beep(self):
+        if not self.pwm:
+            return
+
+        try:
+            self.pwm.stop()
+            self.pwm.ChangeFrequency(2000)
+            self.pwm.start(50)
+            time.sleep(0.10)
+            self.pwm.stop()
+        except Exception:
+            pass
+
+    def error_beep(self):
+        if not self.pwm:
+            return
+
+        try:
+            for _ in range(2):
+                self.pwm.stop()
+                self.pwm.ChangeFrequency(4000)
+                self.pwm.start(50)
+                time.sleep(0.08)
+                self.pwm.stop()
+                time.sleep(0.08)
+        except Exception:
+            pass
+
+    def cleanup(self):
+        try:
+            if self.pwm:
+                self.pwm.stop()
+        except Exception:
+            pass
+
+        try:
+            if self.GPIO and self.pin is not None:
+                self.GPIO.cleanup(self.pin)
+        except Exception:
+            pass
+
+        self.pin = None
+        self.pwm = None
+        self.GPIO = None
+
 def load_students(master_csv):
     by_id = {}
     by_username = {}
@@ -152,11 +233,12 @@ def init_signins_file(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "timestamp",
+                "last_name",
+                "first_name",
                 "student_id",
-                "full_name",
                 "grade",
                 "email",
+                "timestamp",
                 "photo_filename",
             ])
 
@@ -318,6 +400,67 @@ class CaptureWorker(QThread):
         except Exception as e:
             self.failed.emit(str(e))
 
+class RFIDReaderWorker(QThread):
+    tag_read = pyqtSignal(str)
+    status_message = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = True
+
+    def stop(self):
+        self._running = False
+        self.requestInterruption()
+
+    def run(self):
+        try:
+            import RPi.GPIO as GPIO
+            GPIO.setwarnings(False)
+
+            from mfrc522 import SimpleMFRC522
+            reader = SimpleMFRC522()
+        except Exception as e:
+            self.status_message.emit(f"RFID not ready: {e}", "#cc0000")
+            return
+
+            self.status_message.emit("RFID ready.", "#0000aa")
+
+        try:
+            last_tag = None
+            last_tag_at = 0
+            read_no_block = getattr(reader, "read_no_block", None)
+
+            while self._running and not self.isInterruptionRequested():
+                try:
+                    if read_no_block:
+                        _uid, text = read_no_block()
+                        if _uid is None:
+                            self.msleep(100)
+                            continue
+                    else:
+                        _uid, text = reader.read()
+
+                    cleaned = clean_tag_text(text)
+                    if cleaned:
+                        now = time.monotonic()
+                        if cleaned != last_tag or now - last_tag_at > 3:
+                            last_tag = cleaned
+                            last_tag_at = now
+                            self.tag_read.emit(cleaned)
+                    else:
+                        self.status_message.emit("RFID tag is blank. Please try another tag.", "#cc0000")
+                except Exception as e:
+                    if self._running and not self.isInterruptionRequested():
+                        self.status_message.emit(f"RFID read error: {e}", "#cc0000")
+
+                self.msleep(500)
+        finally:
+            try:
+                import RPi.GPIO as GPIO
+                GPIO.cleanup()
+            except Exception:
+                pass
+
 class KioskWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -358,11 +501,13 @@ class KioskWindow(QWidget):
         # Build UI first so widget sizes exist
         self.capture_worker = None
         self.pending_student = None
+        self.sign_in_active = False
+        self.buzzer = None
         self.build_ui()
         self.update_signed_in_count()
 
         # Status reset timer (go back to idle after messages)
-        self.idle_status_text = "Ready. Enter your email/username."
+        self.idle_status_text = "Ready. Type email/username or scan ID."
         self.idle_status_color = "#0000aa"
 
         self._status_reset_timer = QTimer(self)
@@ -378,6 +523,7 @@ class KioskWindow(QWidget):
 
         # Show idle status at startup
         self.show_idle_status()
+        self.start_rfid_reader()
 
         # Now start camera and attach preview widget
         self.picam2.start()
@@ -438,13 +584,13 @@ class KioskWindow(QWidget):
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 26px; font-weight: bold;")
 
-        prompt = QLabel('Enter your Email username\nor scan your student ID\nYou do NOT need the "@cps.k12.ar.us"')
+        prompt = QLabel('Enter your Email username\nor scan your student ID barcode or tag\nYou do NOT need the "@cps.k12.ar.us"')
         prompt.setAlignment(Qt.AlignCenter)
         prompt.setStyleSheet("font-size: 18px;")
 
         self.id_input = QLineEdit()
         self.id_input.setMaxLength(20)
-        self.id_input.setPlaceholderText("Email username")
+        self.id_input.setPlaceholderText("Email username or student ID")
         self.id_input.setStyleSheet("font-size: 26px; padding: 10px;")
         self.id_input.returnPressed.connect(self.handle_sign_in)
 
@@ -516,6 +662,20 @@ class KioskWindow(QWidget):
         self.status.setStyleSheet(f"font-size: 16px; color: {color_hex};")
         self.status.setText(text)
 
+    def success_beep(self):
+        if not hasattr(self, "buzzer") or self.buzzer is None:
+            self.buzzer = PiezoBuzzer()
+
+        if hasattr(self, "buzzer") and self.buzzer:
+            self.buzzer.success_beep()
+
+    def error_beep(self):
+        if not hasattr(self, "buzzer") or self.buzzer is None:
+            self.buzzer = PiezoBuzzer()
+
+        if hasattr(self, "buzzer") and self.buzzer:
+            self.buzzer.error_beep()
+
     def _position_success_popup(self):
         x = max(0, (self.width() - self.success_popup.width()) // 2)
         y = max(0, (self.height() - self.success_popup.height()) // 2)
@@ -527,6 +687,34 @@ class KioskWindow(QWidget):
         self.success_popup.raise_()
         self.success_popup.show()
         QTimer.singleShot(duration_ms, self.success_popup.hide)
+
+    def start_rfid_reader(self):
+        self.rfid_worker = RFIDReaderWorker(self)
+        self.rfid_worker.tag_read.connect(self.on_rfid_tag_read)
+        self.rfid_worker.status_message.connect(self.on_rfid_status_message)
+        self.rfid_worker.start()
+
+    def on_rfid_status_message(self, message: str, color_hex: str):
+        self.set_status(message, color_hex)
+        if hasattr(self, "_status_reset_timer") and self.clock_ready:
+            self._status_reset_timer.start(5000)
+
+    def on_rfid_tag_read(self, tag_text: str):
+        if not self.clock_ready:
+            return
+
+        if (
+            (self.capture_worker and self.capture_worker.isRunning())
+            or self.sign_in_active
+            or self.pending_student
+            or not self.id_input.isEnabled()
+        ):
+            self.set_status("Already processing a sign-in. Please wait.", "#cc0000")
+            self._status_reset_timer.start(3000)
+            return
+
+        self.id_input.setText(tag_text)
+        self.handle_sign_in()
 
     def refresh_today_paths(self, force=False):
         day_str = now_local().strftime("%Y-%m-%d")
@@ -555,6 +743,9 @@ class KioskWindow(QWidget):
         if self.capture_worker and self.capture_worker.isRunning():
             return
 
+        if self.sign_in_active:
+            return
+
         raw_input = self.id_input.text()
         login = normalize_login(raw_input)
 
@@ -577,6 +768,8 @@ class KioskWindow(QWidget):
             self.close()
             return
 
+        self.sign_in_active = True
+
         # --- Lookup student by numeric ID OR username/email ---
         student = None
         student_id = None
@@ -593,17 +786,23 @@ class KioskWindow(QWidget):
 
         if not student:
             self.set_status("ID or email not found. Please try again.", "#cc0000")
+            self.error_beep()
             self._status_reset_timer.start(4000)
             self.id_input.clear()
+            self.sign_in_active = False
             return
 
         # Duplicate sign-in check (always use resolved numeric ID)
         if student_id in self.signed_in_ids:
             full_name = student.get("Full Name", "").strip()
             self.set_status(f"{full_name} is already signed in.", "#cc0000")
+            self.error_beep()
             self._status_reset_timer.start(4000)
             self.id_input.clear()
+            self.sign_in_active = False
             return
+
+        self.success_beep()
 
         # --- From here down, your original flow stays the same ---
         full_name = student.get("Full Name", "").strip()
@@ -624,9 +823,11 @@ class KioskWindow(QWidget):
         dlg = ConfirmDialog(full_name, grade, self)
         if dlg.exec_() != QDialog.Accepted:
             self.set_status("Cancelled. Please re-enter your ID.", "#cc0000")
+            self.error_beep()
             self._status_reset_timer.start(4000)
             self.id_input.clear()
             self.id_input.setFocus()
+            self.sign_in_active = False
             return
 
         # Prepare log + filenames now, but wait to capture until after countdown
@@ -635,7 +836,7 @@ class KioskWindow(QWidget):
         photo_filename = f"{last}_{first}_{now.strftime('%H%M')}_{student_id}.jpg"
         photo_path = os.path.join(self.photos_today_dir, photo_filename)
 
-        self.pending_student = (timestamp_str, student_id, full_name, grade, email, photo_filename)
+        self.pending_student = (last, first, student_id, grade, email, timestamp_str, photo_filename)
         self.photo_path = photo_path
 
         # Start the 3..2..1..SMILE countdown (then capture)
@@ -699,9 +900,11 @@ class KioskWindow(QWidget):
                 writer.writerow(list(self.pending_student))
         except Exception as e:
             self.set_status(f"Photo ok, but log failed: {e}", "#cc0000")
+            self.error_beep()
         else:
-            _, _, full_name, grade, _, _ = self.pending_student
-            self.signed_in_ids.add(self.pending_student[1])
+            last, first, student_id, grade, email, timestamp, photo_filename = self.pending_student
+            full_name = f"{first} {last}"
+            self.signed_in_ids.add(student_id)
             self.update_signed_in_count()
             self.set_status(f"Signed in: {full_name} (Grade {grade})", "#00aa00")
             self.show_success_popup("You have successfully signed in.\nPlease have a seat.", 2200)
@@ -709,18 +912,34 @@ class KioskWindow(QWidget):
             self._status_reset_timer.start(4000)
 
         self.pending_student = None
+        self.sign_in_active = False
         self.id_input.clear()
         self.id_input.setFocus()
         self.sign_in_btn.setEnabled(True)
 
     def on_capture_failed(self, msg):
         self.set_status(f"Camera error: {msg}", "#cc0000")
+        self.error_beep()
         self._status_reset_timer.start(5000)
         self.pending_student = None
+        self.sign_in_active = False
         self.sign_in_btn.setEnabled(True)
         self.id_input.setFocus()
 
     def closeEvent(self, event):
+        try:
+            if hasattr(self, "rfid_worker") and self.rfid_worker and self.rfid_worker.isRunning():
+                self.rfid_worker.stop()
+                self.rfid_worker.wait(1000)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "buzzer") and self.buzzer:
+                self.buzzer.cleanup()
+        except Exception:
+            pass
+
         try:
             self.picam2.stop()
         except Exception:

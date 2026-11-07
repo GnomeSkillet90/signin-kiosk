@@ -751,11 +751,10 @@ class KioskWindow(QWidget):
 
         cmd = (raw_input or "").strip().lower()
 
-        # Command: upload (optional date: "upload 2026-01-17")
-        if cmd == "upload" or cmd.startswith("upload "):
-            parts = cmd.split()
-            date_arg = parts[1] if len(parts) > 1 else None
-            self.start_upload(date_arg=date_arg)
+        # Command: upload (today's folder only; no arguments accepted so
+        # kiosk users can't point the uploader at other folders)
+        if cmd == "upload":
+            self.start_upload()
             self.id_input.clear()
             self.id_input.setFocus()
             return

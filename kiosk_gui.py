@@ -787,7 +787,8 @@ class KioskWindow(QWidget):
             self.set_status("ID or email not found. Please try again.", "#cc0000")
             self.error_beep()
             self._status_reset_timer.start(4000)
-            self.id_input.clear()
+            self.id_input.selectAll()  # keep entry visible; next keystroke/scan replaces it
+            self.id_input.setFocus()
             self.sign_in_active = False
             return
 

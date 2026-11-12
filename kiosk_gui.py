@@ -469,6 +469,7 @@ class KioskWindow(QWidget):
 
         try:
             self.students_by_id, self.students_by_username = load_students(MASTER_CSV)
+            self.students_mtime = os.path.getmtime(MASTER_CSV)
         except FileNotFoundError:
             QMessageBox.critical(self, "Error", f"{MASTER_CSV} not found.")
             sys.exit(1)
@@ -730,6 +731,27 @@ class KioskWindow(QWidget):
         if hasattr(self, "count_label"):
             self.update_signed_in_count()
 
+    def reload_students_if_changed(self):
+        """Pick up roster changes (students_master.csv is kept in sync with the
+        Google Sheet by turnin_scanner/sync_roster.py) without a restart.
+        On any problem, keep using the roster already loaded."""
+        try:
+            mtime = os.path.getmtime(MASTER_CSV)
+            if mtime == self.students_mtime:
+                return
+            by_id, by_username = load_students(MASTER_CSV)
+            if not by_id:
+                raise ValueError("roster file has no students")
+            self.students_by_id, self.students_by_username = by_id, by_username
+            self.students_mtime = mtime
+            print(f"Roster reloaded: {len(by_id)} students", flush=True)
+        except Exception as e:
+            print(f"Roster reload failed, kept previous roster: {e}", flush=True)
+            try:
+                self.students_mtime = os.path.getmtime(MASTER_CSV)  # don't retry a bad file every sign-in
+            except OSError:
+                pass
+
     def handle_sign_in(self):
         if not self.clock_ready:
             return
@@ -768,6 +790,8 @@ class KioskWindow(QWidget):
             return
 
         self.sign_in_active = True
+
+        self.reload_students_if_changed()
 
         # --- Lookup student by numeric ID OR username/email ---
         student = None

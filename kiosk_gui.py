@@ -69,6 +69,15 @@ KIOSK_TZ = ZoneInfo("America/Chicago")
 BUZZER_BCM_PIN = 18
 BUZZER_BOARD_PIN = 12
 
+# On-screen camera preview is PREVIEW_SIZE x PREVIEW_SIZE. The camera delivers
+# preview frames at this size so Qt never has to scale them (much less CPU,
+# which keeps the preview smooth on a Pi 3). Photos use still_config instead.
+PREVIEW_SIZE = 360
+
+# How often to check for an RFID tag when none is present. Each check busy-waits
+# inside the mfrc522 library, so checking less often frees CPU for the preview.
+RFID_IDLE_POLL_MS = 300
+
 # Per-kiosk hardware settings (lives outside the repo, next to kiosk_name).
 # A kiosk without this file uses the defaults below, so each station can
 # differ without changing the shared code. Example contents:
@@ -78,6 +87,9 @@ DEFAULT_KIOSK_SETTINGS = {
     # Rotate the camera preview and saved photos counterclockwise by this many
     # degrees (0, 90, 180 or 270), for cameras mounted sideways/upside down.
     "camera_rotation_ccw": 0,
+    # Read student RFID tags. Turn off on a kiosk with no reader attached so
+    # it does not spend CPU polling for one.
+    "rfid_enabled": True,
 }
 
 
@@ -103,11 +115,16 @@ def load_kiosk_settings() -> dict:
         print("camera_rotation_ccw must be 0, 90, 180 or 270; using 0", flush=True)
         rotation = 0
     settings["camera_rotation_ccw"] = rotation
+
+    if not isinstance(settings["rfid_enabled"], bool):
+        print("rfid_enabled must be true or false; using true", flush=True)
+        settings["rfid_enabled"] = True
     return settings
 
 
 KIOSK_SETTINGS = load_kiosk_settings()
 CAMERA_ROTATION_CCW = KIOSK_SETTINGS["camera_rotation_ccw"]
+RFID_ENABLED = KIOSK_SETTINGS["rfid_enabled"]
 
 
 class RotatedQPicamera2(QPicamera2):
@@ -497,7 +514,7 @@ class RFIDReaderWorker(QThread):
                     if read_no_block:
                         _uid, text = read_no_block()
                         if _uid is None:
-                            self.msleep(100)
+                            self.msleep(RFID_IDLE_POLL_MS)
                             continue
                     else:
                         _uid, text = reader.read()
@@ -546,10 +563,12 @@ class KioskWindow(QWidget):
 
         # Force a full-FOV binned sensor mode (feels more like rpicam-hello)
         self.preview_config = self.picam2.create_preview_configuration(
-            main={"size": (720, 720)},
+            main={"size": (PREVIEW_SIZE, PREVIEW_SIZE)},
             raw={"size": (2304, 1296)},
             transform=Transform(hflip=1),
-            controls={"AfMode": 2}
+            # Cap the preview at 30 fps (the sensor mode can do ~56). The
+            # upper limit still lets frames slow down in dim light.
+            controls={"AfMode": 2, "FrameDurationLimits": (33333, 83333)}
         )
 
         self.still_config = self.picam2.create_still_configuration(
@@ -586,7 +605,8 @@ class KioskWindow(QWidget):
 
         # Show idle status at startup
         self.show_idle_status()
-        self.start_rfid_reader()
+        if RFID_ENABLED:
+            self.start_rfid_reader()
 
         # Now start camera and attach preview widget
         self.picam2.start()
@@ -601,7 +621,7 @@ class KioskWindow(QWidget):
 
         root = QHBoxLayout()
 
-        PREVIEW = 360  # try 360 first on 800x480
+        PREVIEW = PREVIEW_SIZE
 
         self.qpicam = RotatedQPicamera2(
             self.picam2, width=PREVIEW, height=PREVIEW, rotation_ccw=CAMERA_ROTATION_CCW

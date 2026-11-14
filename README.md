@@ -123,6 +123,8 @@ repo, so restoring from GitHub does not bring them back):
 - `settings.json` – optional hardware settings. Missing file = defaults.
     camera_rotation_ccw: rotate preview and photos counterclockwise
                          by 0, 90, 180 or 270 degrees (default 0)
+    rfid_enabled:        read student RFID tags (default true); set false
+                         on a kiosk with no RFID reader attached
 - `drive_sa.json` – Google Drive service account key. Restore from a
   private backup; NEVER commit it.
 
@@ -130,7 +132,8 @@ Current kiosks:
 
     kiosk1 (signin-kiosk):   kiosk_name = kiosk1, no settings.json
     kiosk2 (signin-kiosk2):  kiosk_name = kiosk2
-                             settings.json = {"camera_rotation_ccw": 90}
+                             settings.json = {"camera_rotation_ccw": 90,
+                                              "rfid_enabled": false}
 
 Note for Camera Module 3: the case must not press on the round black
 lens barrel, or autofocus can't move the lens and every photo is blurry.

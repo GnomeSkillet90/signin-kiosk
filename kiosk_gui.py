@@ -1,6 +1,7 @@
 import sys
 import os
 import csv
+import json
 import getpass
 import time
 import subprocess
@@ -67,6 +68,60 @@ UPLOAD_SCRIPT = "/home/gnomeskillet/signin_kiosk/upload_kiosk_day.py"
 KIOSK_TZ = ZoneInfo("America/Chicago")
 BUZZER_BCM_PIN = 18
 BUZZER_BOARD_PIN = 12
+
+# Per-kiosk hardware settings (lives outside the repo, next to kiosk_name).
+# A kiosk without this file uses the defaults below, so each station can
+# differ without changing the shared code. Example contents:
+#     {"camera_rotation_ccw": 90}
+KIOSK_SETTINGS_FILE = os.path.expanduser("~/.config/kiosk/settings.json")
+DEFAULT_KIOSK_SETTINGS = {
+    # Rotate the camera preview and saved photos counterclockwise by this many
+    # degrees (0, 90, 180 or 270), for cameras mounted sideways/upside down.
+    "camera_rotation_ccw": 0,
+}
+
+
+def load_kiosk_settings() -> dict:
+    settings = dict(DEFAULT_KIOSK_SETTINGS)
+    try:
+        with open(KIOSK_SETTINGS_FILE, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            raise ValueError("settings file must contain a JSON object")
+        settings.update(loaded)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"Kiosk settings ignored ({KIOSK_SETTINGS_FILE}): {e}", flush=True)
+        return dict(DEFAULT_KIOSK_SETTINGS)
+
+    try:
+        rotation = int(settings["camera_rotation_ccw"]) % 360
+    except (TypeError, ValueError):
+        rotation = None
+    if rotation not in (0, 90, 180, 270):
+        print("camera_rotation_ccw must be 0, 90, 180 or 270; using 0", flush=True)
+        rotation = 0
+    settings["camera_rotation_ccw"] = rotation
+    return settings
+
+
+KIOSK_SETTINGS = load_kiosk_settings()
+CAMERA_ROTATION_CCW = KIOSK_SETTINGS["camera_rotation_ccw"]
+
+
+class RotatedQPicamera2(QPicamera2):
+    """Camera preview drawn rotated counterclockwise by a multiple of 90 degrees."""
+
+    def __init__(self, *args, rotation_ccw=0, **kwargs):
+        self._rotation_ccw = rotation_ccw
+        super().__init__(*args, **kwargs)
+
+    def fitInView(self):
+        super().fitInView()
+        if self._rotation_ccw:
+            # Qt rotates clockwise for positive angles on screen.
+            self.rotate(-self._rotation_ccw)
 
 
 def now_local() -> datetime:
@@ -386,16 +441,23 @@ class CaptureWorker(QThread):
     done = pyqtSignal(str)    # photo_filename
     failed = pyqtSignal(str)  # error msg
 
-    def __init__(self, picam2, still_config, photo_path):
+    def __init__(self, picam2, still_config, photo_path, rotation_ccw=0):
         super().__init__()
         self.picam2 = picam2
         self.still_config = still_config
         self.photo_path = photo_path
+        self.rotation_ccw = rotation_ccw
 
     def run(self):
         try:
             # Switch from preview mode to still mode for capture (more reliable)
-            self.picam2.switch_mode_and_capture_file(self.still_config, self.photo_path)
+            if self.rotation_ccw:
+                image = self.picam2.switch_mode_and_capture_image(self.still_config)
+                # PIL rotates counterclockwise for positive angles.
+                image = image.rotate(self.rotation_ccw, expand=True)
+                image.convert("RGB").save(self.photo_path, "JPEG", quality=90)
+            else:
+                self.picam2.switch_mode_and_capture_file(self.still_config, self.photo_path)
             self.done.emit(os.path.basename(self.photo_path))
         except Exception as e:
             self.failed.emit(str(e))
@@ -541,7 +603,9 @@ class KioskWindow(QWidget):
 
         PREVIEW = 360  # try 360 first on 800x480
 
-        self.qpicam = QPicamera2(self.picam2, width=PREVIEW, height=PREVIEW)
+        self.qpicam = RotatedQPicamera2(
+            self.picam2, width=PREVIEW, height=PREVIEW, rotation_ccw=CAMERA_ROTATION_CCW
+        )
         self.qpicam.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.qpicam.setFixedSize(PREVIEW, PREVIEW)
 
@@ -998,7 +1062,8 @@ class KioskWindow(QWidget):
         self.capture_worker = CaptureWorker(
             self.picam2,
             self.still_config,
-            self.photo_path
+            self.photo_path,
+            rotation_ccw=CAMERA_ROTATION_CCW,
         )
         self.capture_worker.done.connect(self.on_capture_done)
         self.capture_worker.failed.connect(self.on_capture_failed)

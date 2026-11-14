@@ -113,6 +113,30 @@ The kiosk is configured to start automatically on boot via desktop autostart.
 
 ----------------------------------------------------------------
 
+## PER-KIOSK SETTINGS
+
+Each kiosk keeps its own settings in `~/.config/kiosk/` (outside the
+repo, so restoring from GitHub does not bring them back):
+
+- `kiosk_name` – name used to tag this kiosk's rows in the shared
+  Drive sign-in sheet (e.g. `kiosk1`, `kiosk2`). Must differ per kiosk.
+- `settings.json` – optional hardware settings. Missing file = defaults.
+    camera_rotation_ccw: rotate preview and photos counterclockwise
+                         by 0, 90, 180 or 270 degrees (default 0)
+- `drive_sa.json` – Google Drive service account key. Restore from a
+  private backup; NEVER commit it.
+
+Current kiosks:
+
+    kiosk1 (signin-kiosk):   kiosk_name = kiosk1, no settings.json
+    kiosk2 (signin-kiosk2):  kiosk_name = kiosk2
+                             settings.json = {"camera_rotation_ccw": 90}
+
+Note for Camera Module 3: the case must not press on the round black
+lens barrel, or autofocus can't move the lens and every photo is blurry.
+
+----------------------------------------------------------------
+
 ## UPLOADING ATTENDANCE
 
 From the kiosk:

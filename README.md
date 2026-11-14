@@ -153,6 +153,22 @@ From terminal:
 
 ----------------------------------------------------------------
 
+## MAINTENANCE TOOLS (over SSH)
+
+Restart the sign-in app without rebooting (after a git pull or a
+settings.json change). Log goes to /tmp/kiosk_gui.log:
+    ~/signin_kiosk/restart_kiosk_app.sh
+
+Remove a sign-in (e.g. a test one) from this kiosk and from Drive:
+    ~/kiosk-env/bin/python ~/signin_kiosk/remove_signin.py 2026-11-14 123456789
+The local row and photo are moved to ~/removed_signins/<date>/, the
+row is removed from the shared and per-kiosk CSVs on Drive, and the
+Drive photo is moved to the trash. Restart the app afterwards so the
+student can sign in again. Rows already copied into the Google Sheet
+must be deleted there by hand.
+
+----------------------------------------------------------------
+
 ## REQUIREMENTS
 
 - Raspberry Pi OS (X11 desktop)
@@ -169,7 +185,9 @@ From terminal:
 signin_kiosk/
   kiosk_gui.py
   upload_kiosk_day.py
-  README.txt
+  restart_kiosk_app.sh
+  remove_signin.py
+  README.md
   .gitignore
   signin_kiosk_data/   (ignored; created at runtime)
 

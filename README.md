@@ -133,7 +133,8 @@ repo, so restoring from GitHub does not bring them back):
 
 Current kiosks:
 
-    kiosk1 (signin-kiosk):   kiosk_name = kiosk1, no settings.json
+    kiosk1 (signin-kiosk):   kiosk_name = kiosk1
+                             settings.json = defaults (copy of settings.example.json)
     kiosk2 (signin-kiosk2):  kiosk_name = kiosk2
                              settings.json = {"camera_rotation_ccw": 90,
                                               "rfid_enabled": false}

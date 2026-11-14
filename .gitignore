@@ -13,6 +13,7 @@ signins/
 
 # Secrets
 *.json
+!settings.example.json
 .config/
 .env
 

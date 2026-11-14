@@ -121,6 +121,9 @@ repo, so restoring from GitHub does not bring them back):
 - `kiosk_name` – name used to tag this kiosk's rows in the shared
   Drive sign-in sheet (e.g. `kiosk1`, `kiosk2`). Must differ per kiosk.
 - `settings.json` – optional hardware settings. Missing file = defaults.
+  Start from the template, which holds the defaults, then edit it:
+      cp ~/signin_kiosk/settings.example.json ~/.config/kiosk/settings.json
+  Restart the app to apply changes (~/signin_kiosk/restart_kiosk_app.sh).
     camera_rotation_ccw: rotate preview and photos counterclockwise
                          by 0, 90, 180 or 270 degrees (default 0)
     rfid_enabled:        read student RFID tags (default true); set false

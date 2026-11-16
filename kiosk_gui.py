@@ -3,6 +3,8 @@ import os
 import csv
 import json
 import getpass
+import glob
+import threading
 import time
 import subprocess
 
@@ -68,6 +70,30 @@ UPLOAD_SCRIPT = "/home/gnomeskillet/signin_kiosk/upload_kiosk_day.py"
 KIOSK_TZ = ZoneInfo("America/Chicago")
 BUZZER_BCM_PIN = 18
 BUZZER_BOARD_PIN = 12
+
+# Buzzer tunes. Steps: ("tone", hz, seconds), ("rest", seconds) or
+# ("glide", from_hz, to_hz, seconds). A magnetic buzzer is loudest around
+# 1.5-4 kHz, so the tunes sit in the upper octaves.
+_NOTE_HZ = {
+    "E5": 659, "F5": 698, "G5": 784, "Ab5": 831, "Bb5": 932,
+    "C6": 1047, "E6": 1319, "G6": 1568, "A6": 1760, "C7": 2093,
+}
+BUZZER_TUNES = {
+    # Rising chime when the program starts
+    "startup": [("tone", _NOTE_HZ["G5"], 0.10), ("tone", _NOTE_HZ["C6"], 0.10),
+                ("tone", _NOTE_HZ["E6"], 0.10), ("tone", _NOTE_HZ["G6"], 0.25)],
+    # Short blip: student identified, keep going
+    "beep": [("tone", _NOTE_HZ["A6"], 0.04)],
+    # "Ba-da-ding": finished successfully
+    "success": [("tone", _NOTE_HZ["C6"], 0.07), ("rest", 0.01), ("tone", _NOTE_HZ["E6"], 0.07), ("rest", 0.01),
+                ("tone", _NOTE_HZ["G6"], 0.07), ("rest", 0.01), ("tone", _NOTE_HZ["C7"], 0.18)],
+    # "Bwah-bwaaah": the student needs to try again
+    "failure": [("tone", _NOTE_HZ["Bb5"], 0.15), ("rest", 0.05),
+                ("glide", _NOTE_HZ["Ab5"], _NOTE_HZ["E5"], 0.40)],
+    # Triple buzz: a hardware or system problem
+    "error": [("tone", _NOTE_HZ["F5"], 0.10), ("rest", 0.06), ("tone", _NOTE_HZ["F5"], 0.10),
+              ("rest", 0.06), ("tone", _NOTE_HZ["F5"], 0.10)],
+}
 
 # On-screen camera preview is PREVIEW_SIZE x PREVIEW_SIZE. The camera delivers
 # preview frames at this size so Qt never has to scale them (much less CPU,
@@ -193,11 +219,62 @@ def clean_tag_text(text: str) -> str:
 
 
 class PiezoBuzzer:
-    def __init__(self, bcm_pin=BUZZER_BCM_PIN, board_pin=BUZZER_BOARD_PIN):
-        self.pin = None
-        self.GPIO = None
-        self.pwm = None
+    """
+    Plays BUZZER_TUNES on the passive buzzer (transistor-driven, GPIO18 /
+    physical pin 12) in a background thread, so callers never wait. A sound
+    asked for while another is playing is skipped, not queued.
 
+    Uses kernel hardware PWM when the Pi has it turned on with
+        dtoverlay=pwm,pin=18,func=2      (in /boot/firmware/config.txt)
+    which keeps the notes in tune. Without it, falls back to RPi.GPIO
+    software PWM on the same pin: the same tunes, slightly rougher.
+    """
+
+    # BCM pin -> hardware PWM channel
+    HARDWARE_CHANNEL = {12: 0, 18: 0, 13: 1, 19: 1}
+
+    def __init__(self, bcm_pin=BUZZER_BCM_PIN, board_pin=BUZZER_BOARD_PIN):
+        self._lock = threading.Lock()
+        self.hw_dir = None   # /sys/class/pwm/pwmchipN/pwmM when using hardware PWM
+        self.pwm = None      # RPi.GPIO PWM object when using software PWM
+        self.GPIO = None
+        self.pin = None
+        try:
+            self.hw_dir = self._open_hardware_pwm(bcm_pin)
+        except Exception:
+            self.hw_dir = None
+        if self.hw_dir is None:
+            self._open_software_pwm(bcm_pin, board_pin)
+
+    def _open_hardware_pwm(self, bcm_pin):
+        channel = self.HARDWARE_CHANNEL.get(bcm_pin)
+        if channel is None:
+            return None
+        for chip in sorted(glob.glob("/sys/class/pwm/pwmchip*")):
+            with open(os.path.join(chip, "npwm")) as f:
+                if int(f.read()) <= channel:
+                    continue
+            path = os.path.join(chip, f"pwm{channel}")
+            if not os.path.isdir(path):
+                with open(os.path.join(chip, "export"), "w") as f:
+                    f.write(str(channel))
+            # udev hands the new files to the gpio group a moment after export
+            for _ in range(50):
+                if os.access(os.path.join(path, "duty_cycle"), os.W_OK):
+                    break
+                time.sleep(0.02)
+            self._hw_write(path, "duty_cycle", 0)
+            self._hw_write(path, "period", 1000000)
+            self._hw_write(path, "enable", 1)
+            return path
+        return None
+
+    @staticmethod
+    def _hw_write(path, name, value):
+        with open(os.path.join(path, name), "w") as f:
+            f.write(str(value))
+
+    def _open_software_pwm(self, bcm_pin, board_pin):
         try:
             import RPi.GPIO as GPIO
 
@@ -214,42 +291,71 @@ class PiezoBuzzer:
                 return
 
             GPIO.setup(self.pin, GPIO.OUT)
-
             self.GPIO = GPIO
             self.pwm = GPIO.PWM(self.pin, 2000)
+            self.pwm.start(0)  # running but silent
         except Exception:
             self.GPIO = None
             self.pwm = None
 
-    def success_beep(self):
-        if not self.pwm:
-            return
+    def _tone(self, hz):
+        hz = max(100, int(hz))
+        if self.hw_dir:
+            period = int(1e9 / hz)
+            self._hw_write(self.hw_dir, "duty_cycle", 0)  # duty may never exceed the period
+            self._hw_write(self.hw_dir, "period", period)
+            self._hw_write(self.hw_dir, "duty_cycle", period // 2)
+        elif self.pwm:
+            self.pwm.ChangeFrequency(hz)
+            self.pwm.ChangeDutyCycle(50)
 
+    def _quiet(self):
+        if self.hw_dir:
+            self._hw_write(self.hw_dir, "duty_cycle", 0)
+        elif self.pwm:
+            self.pwm.ChangeDutyCycle(0)
+
+    def _run(self, steps):
         try:
-            self.pwm.stop()
-            self.pwm.ChangeFrequency(2000)
-            self.pwm.start(50)
-            time.sleep(0.10)
-            self.pwm.stop()
+            for step in steps:
+                if step[0] == "tone":
+                    self._tone(step[1])
+                    time.sleep(step[2])
+                elif step[0] == "rest":
+                    self._quiet()
+                    time.sleep(step[1])
+                elif step[0] == "glide":
+                    start_hz, end_hz, seconds = step[1:]
+                    for i in range(41):
+                        self._tone(start_hz + (end_hz - start_hz) * i / 40)
+                        time.sleep(seconds / 40)
         except Exception:
             pass
+        finally:
+            try:
+                self._quiet()
+            except Exception:
+                pass
+            self._lock.release()
 
-    def error_beep(self):
-        if not self.pwm:
+    def play(self, name):
+        steps = BUZZER_TUNES.get(name)
+        if not steps or not (self.hw_dir or self.pwm):
             return
-
-        try:
-            for _ in range(2):
-                self.pwm.stop()
-                self.pwm.ChangeFrequency(4000)
-                self.pwm.start(50)
-                time.sleep(0.08)
-                self.pwm.stop()
-                time.sleep(0.08)
-        except Exception:
-            pass
+        if not self._lock.acquire(blocking=False):
+            return  # another sound is playing
+        threading.Thread(target=self._run, args=(steps,), daemon=True).start()
 
     def cleanup(self):
+        # Let a sound that is playing finish (they are all under a second).
+        got_lock = self._lock.acquire(timeout=1.5)
+        try:
+            if self.hw_dir:
+                self._hw_write(self.hw_dir, "duty_cycle", 0)
+                self._hw_write(self.hw_dir, "enable", 0)
+        except Exception:
+            pass
+
         try:
             if self.pwm:
                 self.pwm.stop()
@@ -262,9 +368,13 @@ class PiezoBuzzer:
         except Exception:
             pass
 
+        self.hw_dir = None
         self.pin = None
         self.pwm = None
         self.GPIO = None
+        if got_lock:
+            self._lock.release()
+
 
 def load_students(master_csv):
     by_id = {}
@@ -706,6 +816,7 @@ class KioskWindow(QWidget):
         self.setLayout(root)
 
         self.showFullScreen()
+        self.play_sound("startup")
         self.id_input.setFocus()
 
     def update_signed_in_count(self):
@@ -747,19 +858,11 @@ class KioskWindow(QWidget):
         self.status.setStyleSheet(f"font-size: 16px; color: {color_hex};")
         self.status.setText(text)
 
-    def success_beep(self):
-        if not hasattr(self, "buzzer") or self.buzzer is None:
+    def play_sound(self, name):
+        """name: a key of BUZZER_TUNES. Returns at once; the sound plays in the background."""
+        if self.buzzer is None:
             self.buzzer = PiezoBuzzer()
-
-        if hasattr(self, "buzzer") and self.buzzer:
-            self.buzzer.success_beep()
-
-    def error_beep(self):
-        if not hasattr(self, "buzzer") or self.buzzer is None:
-            self.buzzer = PiezoBuzzer()
-
-        if hasattr(self, "buzzer") and self.buzzer:
-            self.buzzer.error_beep()
+        self.buzzer.play(name)
 
     def _position_success_popup(self):
         x = max(0, (self.width() - self.success_popup.width()) // 2)
@@ -893,7 +996,7 @@ class KioskWindow(QWidget):
 
         if not student:
             self.set_status("ID or email not found. Please try again.", "#cc0000")
-            self.error_beep()
+            self.play_sound("failure")
             self._status_reset_timer.start(4000)
             self.id_input.selectAll()  # keep entry visible; next keystroke/scan replaces it
             self.id_input.setFocus()
@@ -904,13 +1007,13 @@ class KioskWindow(QWidget):
         if student_id in self.signed_in_ids:
             full_name = student.get("Full Name", "").strip()
             self.set_status(f"{full_name} is already signed in.", "#cc0000")
-            self.error_beep()
+            self.play_sound("failure")
             self._status_reset_timer.start(4000)
             self.id_input.clear()
             self.sign_in_active = False
             return
 
-        self.success_beep()
+        self.play_sound("beep")
 
         # --- From here down, your original flow stays the same ---
         full_name = student.get("Full Name", "").strip()
@@ -931,7 +1034,7 @@ class KioskWindow(QWidget):
         dlg = ConfirmDialog(full_name, grade, self)
         if dlg.exec_() != QDialog.Accepted:
             self.set_status("Cancelled. Please re-enter your ID.", "#cc0000")
-            self.error_beep()
+            self.play_sound("failure")
             self._status_reset_timer.start(4000)
             self.id_input.clear()
             self.id_input.setFocus()
@@ -1008,13 +1111,14 @@ class KioskWindow(QWidget):
                 writer.writerow(list(self.pending_student))
         except Exception as e:
             self.set_status(f"Photo ok, but log failed: {e}", "#cc0000")
-            self.error_beep()
+            self.play_sound("error")
         else:
             last, first, student_id, grade, email, timestamp, photo_filename = self.pending_student
             full_name = f"{first} {last}"
             self.signed_in_ids.add(student_id)
             self.update_signed_in_count()
             self.set_status(f"Signed in: {full_name} (Grade {grade})", "#00aa00")
+            self.play_sound("success")
             self.show_success_popup("You have successfully signed in.\nPlease have a seat.", 2200)
             # After 4 seconds, go back to idle message
             self._status_reset_timer.start(4000)
@@ -1027,7 +1131,7 @@ class KioskWindow(QWidget):
 
     def on_capture_failed(self, msg):
         self.set_status(f"Camera error: {msg}", "#cc0000")
-        self.error_beep()
+        self.play_sound("error")
         self._status_reset_timer.start(5000)
         self.pending_student = None
         self.sign_in_active = False
